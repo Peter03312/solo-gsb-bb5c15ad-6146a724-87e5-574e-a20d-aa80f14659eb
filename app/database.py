@@ -517,8 +517,16 @@ def _verify_audit_chain(
     5. 与业务表交叉比对：created 事件的请求摘要/名称/种子须与 tasks 行一致，
        finished 事件的结果摘要/状态须与 tasks.result 一致，quota_settled
        事件须与 quota_reservations 实际预留（或 quota_exceeded 缺额）一致；
-    6. 状态完备性：running/done 的任务必须存在 started 事件；done 任务必须
-       存在 finished 事件；声明 use_quota 的任务必须存在 quota_settled 事件。
+    6. 状态完备性（**按任务当前状态分阶段判定**，尚未到达的阶段不要求后续事件，
+       避免把求解中途的正常任务误判为断链）：
+       - pending：链至少须有 created（空链已在第 1 步判定）；链上出现
+         started/finished/quota_settled 而任务仍停留在 pending 属于状态被回退
+         的篡改（event_ahead_of_status，断点定位到首个越阶段事件）；
+       - running：须已有 created、started；链上出现 finished（其后必有结算）而
+         任务仍是 running 属于状态被回退（event_ahead_of_status）；
+       - done：须有 started、finished；声明 use_quota 的 done 任务还须恰有一条
+         quota_settled（唯一性已在第 4 步判定）；非配额任务不得出现该事件；
+       - 未知任务状态判 unexpected_task_status。
     """
     if not events:
         return _audit_break(None, "empty_chain", expected="created as seq 1")
@@ -677,32 +685,71 @@ def _verify_audit_chain(
 
         prev_hash = ev["hash"]
 
-    # 6. 状态完备性（断点定位到链尾之后，at_seq=null）
-    if task["status"] in ("running", "done") and "started" not in seen_phases:
-        return _audit_break(
-            None, "started_event_missing",
-            expected=f"started event for task status {task['status']}",
-        )
-    if task["status"] == "done" and not finished_seen:
-        return _audit_break(
-            None, "finished_event_missing",
-            expected="finished event for done task",
-        )
+    # 6. 状态完备性（按任务当前状态分阶段判定；断点定位到链尾之后 at_seq=null，
+    #    或定位到超出当前阶段的首个事件序号）
     try:
         req = json.loads(task["request"])
     except (ValueError, TypeError):
         return _audit_break(None, "request_not_json", actual=task["request"])
     if not isinstance(req, dict):
         return _audit_break(None, "request_not_object")
-    if req.get("use_quota") and "quota_settled" not in seen_phases:
-        return _audit_break(
-            None, "quota_settled_event_missing",
-            expected="quota_settled event for use_quota task",
+
+    task_status = task["status"]
+    if task_status == "pending":
+        # pending 阶段允许仅有 created；后续阶段事件出现而状态仍为 pending，
+        # 说明 tasks.status 被离线回退（事件不可能在正常流转中先行）
+        ahead = next(
+            (et for et in ("started", "finished", "quota_settled") if et in seen_phases),
+            None,
         )
-    if "quota_settled" in seen_phases and not req.get("use_quota"):
+        if ahead is not None:
+            return _audit_break(
+                seen_phases[ahead],
+                "event_ahead_of_status",
+                expected=f"no {ahead} event while task is pending",
+                actual=f"{ahead} at seq {seen_phases[ahead]}",
+            )
+    elif task_status == "running":
+        if "started" not in seen_phases:
+            return _audit_break(
+                None, "started_event_missing",
+                expected="started event for task status running",
+            )
+        if "finished" in seen_phases:
+            # finished 只在结算为 done 的同一事务追加：running 而有 finished
+            # 必为状态被回退/任务行被改写
+            return _audit_break(
+                seen_phases["finished"],
+                "event_ahead_of_status",
+                expected="no finished event while task is running",
+                actual=f"finished at seq {seen_phases['finished']}",
+            )
+    elif task_status == "done":
+        if "started" not in seen_phases:
+            return _audit_break(
+                None, "started_event_missing",
+                expected="started event for task status done",
+            )
+        if not finished_seen:
+            return _audit_break(
+                None, "finished_event_missing",
+                expected="finished event for done task",
+            )
+        if req.get("use_quota") and "quota_settled" not in seen_phases:
+            return _audit_break(
+                None, "quota_settled_event_missing",
+                expected="quota_settled event for done use_quota task",
+            )
+        if "quota_settled" in seen_phases and not req.get("use_quota"):
+            return _audit_break(
+                None, "unexpected_quota_settled",
+                expected="no quota_settled event without use_quota",
+            )
+    else:
         return _audit_break(
-            None, "unexpected_quota_settled",
-            expected="no quota_settled event without use_quota",
+            None, "unexpected_task_status",
+            expected="task status in ('pending', 'running', 'done')",
+            actual=task_status,
         )
     return None
 

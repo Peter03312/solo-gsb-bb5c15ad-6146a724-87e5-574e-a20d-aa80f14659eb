@@ -1260,7 +1260,7 @@ curl http://localhost:8000/api/tasks/21/audit
 3. **内容摘要**：按同一规范化口径重算事件体哈希，与存储 `hash` 不符返回 `hash_mismatch`；载荷不是合法 JSON / 非规范化文本返回 `payload_not_json` / `payload_not_canonical`；未知事件类型返回 `unknown_event_type`；
 4. **生命周期**：`created` / `started` / `finished` 各至多一次（重复为 `duplicate_event`），且必须按 `created → started → finished → quota_settled` 的顺序出现（越序或缺前驱为 `event_order`）；
 5. **与业务表交叉比对**：`created` 载荷的 `request_sha256` / `name` / `seed` 与 `tasks` 行不符（`request_digest_mismatch` / `name_mismatch` / `seed_mismatch`）；`finished` 的 `result_sha256` / `result_status` 与 `tasks.result` 不符（`result_digest_mismatch` / `result_status_mismatch`）；`quota_settled` 的逐题预留/缺额与 `quota_reservations`、任务结果不符（`reservations_mismatch` / `shortages_mismatch` / `settlement_outcome_mismatch`）；
-6. **状态完备性**：`running`/`done` 任务缺 `started` 事件、`done` 任务缺 `finished` 事件、声明 `use_quota` 的任务缺 `quota_settled` 事件（分别为 `started_event_missing` / `finished_event_missing` / `quota_settled_event_missing`，此时 `at_seq` 为 `null`，断点位于链尾之后）。
+6. **状态完备性（按任务当前状态分阶段判定）**：完备性要求随任务状态推进——`pending` 阶段允许链上仅有 `created`；`running` 阶段须有 `created`、`started`；`done` 任务还须有 `finished`，声明 `use_quota` 的 `done` 任务须恰有一条 `quota_settled`（缺事件分别为 `started_event_missing` / `finished_event_missing` / `quota_settled_event_missing`，`at_seq` 为 `null`，断点位于链尾之后）。因此**任务刚创建或仍在求解时也可随时审计**：尚未生成的 `finished` / `quota_settled` 不再被误判为断点；非配额任务出现结算事件为 `unexpected_quota_settled`，任务状态被离线回退（如 `pending` 任务链上已有 `started`）为 `event_ahead_of_status`（`at_seq` 定位首个越阶段事件），未知任务状态为 `unexpected_task_status`。
 
 校验在**单一只读事务快照**中读取任务行、事件链与预留明细后重放（不存在跨连接的瞬时不一致），任何一项失败 `valid` 即为 `false`，**不存在“链被改动但仍报告通过”的情况**——即使攻击者重新计算全部事件哈希使链自洽，业务文本摘要的交叉比对也会暴露篡改。例如下例中第 2 个事件的前驱哈希被改动：
 
@@ -1280,7 +1280,46 @@ curl http://localhost:8000/api/tasks/21/audit
 }
 ```
 
-> 审计事件表只追加，服务不提供任何修改/删除接口；`last_hash` 可作为外部留存的链顶锚点，与历史响应中的值逐次比对即可发现库被离线改写。
+> 审计事件表只追加，服务不提供任何修改/删除接口；`last_hash` 可作为外部留存的链顶锚点，与历史响应中的链顶锚点逐次比对即可发现库被离线改写。
+
+### 求解中途也可审计（分阶段用法）
+
+审计接口在任务生命周期的**任何阶段**都可调用，完备性按 `tasks.status` 分阶段判定，因此教研组不必等到任务完成即可核对链是否被改动；每个阶段已有事件的序号、前驱哈希、内容摘要及与业务表的交叉校验始终全部生效：
+
+| 调用时刻（`tasks.status`） | 链上合法形态 | `valid=true` 的条件 |
+| --- | --- | --- |
+| 刚创建、等待领取（`pending`） | `created` | 仅此 1 个事件，且与 `tasks` 行摘要一致 |
+| 正在求解（`running`） | `created → started` | 2 个事件逐环咬合、`started` 载荷合法 |
+| 已完成（`done`，普通任务） | `created → started → finished` | 3 个事件，结果摘要与 `tasks.result` 一致 |
+| 已完成（`done`，`use_quota` 任务） | `created → started → finished → quota_settled` | 4 个事件，结算与 `quota_reservations` / 结果交叉一致 |
+
+典型排查流程：提交启用曝光配额的任务后**立即**审计，应看到 `pending` 任务仅有 `created` 且 `valid=true`；被 worker 领取后再次审计，`running` 任务应有 `created → started` 两个事件且仍为 `valid=true`；任务 `done` 后第 4 个事件 `quota_settled` 才成为必备项。任一刻若链上事件被删除、乱序或改写（如篡改 `tasks.request`、把状态回退为 `pending`），`valid` 立即为 `false` 并返回首个断点。
+
+```bash
+# 1) 提交一个启用曝光配额的任务（可带租约），拿到 task_id
+curl -s -X POST http://localhost:8000/api/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"高三数学月考","seed":42,"use_quota":true,"lease_seconds":600,"questions":[…]}'
+
+# 2) 刚创建 / 排队中：pending 阶段允许仅有 created，valid=true
+curl -s http://localhost:8000/api/tasks/22/audit | jq '{valid, break_point, events: [.events[].type]}'
+# => {"valid": true, "break_point": null, "events": ["created"]}
+
+# 3) 求解中：running 阶段应有 created、started，valid=true
+curl -s http://localhost:8000/api/tasks/22/audit | jq '{valid, break_point, events: [.events[].type]}'
+# => {"valid": true, "break_point": null, "events": ["created", "started"]}
+
+# 4) 完成后：配额任务须有 finished 与唯一的 quota_settled
+curl -s http://localhost:8000/api/tasks/22/audit \
+  | jq '{valid, break_point, last_hash, events: [.events[].type]}'
+# => {"valid": true, "break_point": null, "last_hash": "a301…7f21",
+#     "events": ["created", "started", "finished", "quota_settled"]}
+
+# 5) 状态被离线回退（done/pending 与链不一致）时报告首个越阶段事件
+# => {"valid": false, "break_point": {"at_seq": 2, "kind": "event_ahead_of_status", …}}
+```
+
+任务不存在时接口返回 `404`；`events`、`last_hash`、`break_point` 字段在各阶段保持同一口径（详见上节）。
 
 ## 录分与仲裁（初评/复评/仲裁）
 

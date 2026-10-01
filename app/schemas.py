@@ -698,7 +698,9 @@ class AuditBreakOut(BaseModel):
             "异常类别：empty_chain / seq_gap / unexpected_first_event / "
             "prev_hash_mismatch / hash_mismatch / payload_not_json / "
             "payload_not_canonical / request_digest_mismatch / "
-            "result_digest_mismatch / quota_settled_event_missing 等"
+            "result_digest_mismatch / event_ahead_of_status / "
+            "started_event_missing / finished_event_missing / "
+            "quota_settled_event_missing / unexpected_task_status 等"
         ),
     )
     expected: Optional[Any] = None

@@ -74,7 +74,7 @@ app = FastAPI(
         "，以及面向已完成可行任务首个候选卷组的成绩批次发布"
         "（单事务快照一次性冻结全批逐题有效分与总分）"
     ),
-    version="1.14.0",
+    version="1.15.0",
     lifespan=lifespan,
 )
 
@@ -622,10 +622,23 @@ def get_task_audit(task_id: int) -> TaskAuditOut:
     """查询任务的防篡改审计事件链及校验结论。
 
     返回按序号排列的全部事件（created / started / finished / quota_settled）
-    与逐条重放 SHA-256 哈希链、交叉比对任务/配额业务表后的校验结论：
+    与逐条重放 SHA-256 哈希链、交叉比对任务/配额业务表后的校验结论。完备性
+    判定**按任务当前状态分阶段**进行，求解中途审计同样可用，不会把尚未生成的
+    后续事件误判为断链：
 
-    - ``valid=true``：序号从 1 连续、前驱哈希逐环咬合、事件内容摘要全部重算
-      一致，且请求/结果摘要、配额预留与业务表实际内容相符；
+    - ``pending``：允许链上仅有 ``created``（任务刚创建、尚未被领取）；
+    - ``running``：应有 ``created``、``started``（仍在求解，finished 尚未生成）；
+    - ``done``：须有 ``created``、``started``、``finished``；声明 ``use_quota``
+      的任务还须有且仅有一条 ``quota_settled``。
+
+    无论处于哪个阶段，链上**已有事件**的序号连续性、前驱哈希咬合、事件内容
+    摘要重算，以及 created/finished/quota_settled 与 tasks、quota_reservations
+    业务表的交叉比对都照常执行；真实缺失、乱序、重复或内容被改动时继续返回
+    **首个**断点，绝不伪报通过。任务状态被离线回退（如 pending 任务链上已有
+    started）报告 ``event_ahead_of_status``。
+
+    - ``valid=true``：当前阶段要求的事件齐备，且已有事件的序号、前驱哈希、
+      内容摘要、业务表交叉校验全部一致；
     - ``valid=false``：``break_point`` 给出**首个**断点的序号、类别与
       期望/实际值（不伪报通过），``events`` 仍返回链上全部记录以便定位。
 
