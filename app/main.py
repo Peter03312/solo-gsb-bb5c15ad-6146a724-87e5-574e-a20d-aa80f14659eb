@@ -629,6 +629,13 @@ def get_task_audit(task_id: int) -> TaskAuditOut:
     - ``valid=false``：``break_point`` 给出**首个**断点的序号、类别与
       期望/实际值（不伪报通过），``events`` 仍返回链上全部记录以便定位。
 
+    完备性按任务当前状态判定：``pending`` 任务允许链上仅有 ``created``；
+    ``running`` 任务应有 ``created``、``started``；``done`` 任务必须有
+    ``finished``，且声明 ``use_quota`` 的 ``done`` 任务还必须有唯一的
+    ``quota_settled``。尚未结算的任务暂缺 ``finished`` / ``quota_settled``
+    属正常中间态，不计缺失；事件一旦落链，其序号、前驱哈希、内容摘要及与
+    业务表的交叉校验在任一阶段都同样严格。
+
     事件哈希口径：对 ``{task_id, seq, type, created_at, payload, prev_hash}``
     的规范化 JSON（UTF-8、键升序、无空白、不转义非 ASCII）计算 SHA-256；
     首事件前驱为 64 个 0。

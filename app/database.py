@@ -517,8 +517,10 @@ def _verify_audit_chain(
     5. 与业务表交叉比对：created 事件的请求摘要/名称/种子须与 tasks 行一致，
        finished 事件的结果摘要/状态须与 tasks.result 一致，quota_settled
        事件须与 quota_reservations 实际预留（或 quota_exceeded 缺额）一致；
-    6. 状态完备性：running/done 的任务必须存在 started 事件；done 任务必须
-       存在 finished 事件；声明 use_quota 的任务必须存在 quota_settled 事件。
+    6. 状态完备性（按任务当前状态判定）：running/done 的任务必须存在 started
+       事件；done 任务必须存在 finished 事件；done 且声明 use_quota 的任务
+       必须存在 quota_settled 事件。pending/running 任务尚未结算，链上暂缺
+       finished/quota_settled 属正常中间态，不计缺失（唯一性仍由第 4 步保证）。
     """
     if not events:
         return _audit_break(None, "empty_chain", expected="created as seq 1")
@@ -677,7 +679,10 @@ def _verify_audit_chain(
 
         prev_hash = ev["hash"]
 
-    # 6. 状态完备性（断点定位到链尾之后，at_seq=null）
+    # 6. 状态完备性（断点定位到链尾之后，at_seq=null）：按任务当前状态要求
+    # 链上应已沉淀的事件——pending 允许仅有 created；running 起必须有 started；
+    # done 必须有 finished；done 且声明 use_quota 时必须有 quota_settled。
+    # pending/running 的配额任务尚未结算，quota_settled 尚未生成，不计缺失。
     if task["status"] in ("running", "done") and "started" not in seen_phases:
         return _audit_break(
             None, "started_event_missing",
@@ -694,10 +699,14 @@ def _verify_audit_chain(
         return _audit_break(None, "request_not_json", actual=task["request"])
     if not isinstance(req, dict):
         return _audit_break(None, "request_not_object")
-    if req.get("use_quota") and "quota_settled" not in seen_phases:
+    if (
+        task["status"] == "done"
+        and req.get("use_quota")
+        and "quota_settled" not in seen_phases
+    ):
         return _audit_break(
             None, "quota_settled_event_missing",
-            expected="quota_settled event for use_quota task",
+            expected="quota_settled event for done use_quota task",
         )
     if "quota_settled" in seen_phases and not req.get("use_quota"):
         return _audit_break(
